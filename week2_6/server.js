@@ -1,29 +1,47 @@
 const express = require("express");
 const swaggerUi = require("swagger-ui-express");
+const Database = require("better-sqlite3");
 
 const app = express();
 app.use(express.json());
 
-// In-memory storage
-let tasks = [
-  { id: 1, title: "Buy milk", done: false },
-  { id: 2, title: "Read book", done: true },
-  { id: 3, title: "Write code", done: false }
-];
+// Database setup
+// Opens tasks.db, or creates the file if it does not exist yet.
+const db = new Database("tasks.db");
 
-// Helpers
-function getNextId() {
-  let maxId = 0;
-  for (const task of tasks) {
-    if (task.id > maxId) {
-      maxId = task.id;
-    }
-  }
-  return maxId + 1;
+db.prepare(
+  `CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    done INTEGER NOT NULL DEFAULT 0
+  )`
+).run();
+
+// Seed the table only when it is empty, so restarting never duplicates tasks.
+const taskCount = db.prepare("SELECT COUNT(*) AS count FROM tasks").get();
+if (taskCount.count === 0) {
+  const insertSeed = db.prepare("INSERT INTO tasks (title, done) VALUES (?, ?)");
+  insertSeed.run("Buy milk", 0);
+  insertSeed.run("Read book", 1);
+  insertSeed.run("Write code", 0);
+  console.log("Seeded 3 default tasks");
 }
 
-function findTask(id) {
-  return tasks.find((task) => task.id === Number(id));
+// Prepared statements (reused by the routes below)
+const selectAllTasks = db.prepare("SELECT id, title, done FROM tasks");
+const selectTaskById = db.prepare("SELECT id, title, done FROM tasks WHERE id = ?");
+const insertTask = db.prepare("INSERT INTO tasks (title, done) VALUES (?, 0)");
+const updateTask = db.prepare("UPDATE tasks SET title = ?, done = ? WHERE id = ?");
+const deleteTask = db.prepare("DELETE FROM tasks WHERE id = ?");
+
+// Helpers
+// SQLite stores done as 0 or 1, but the API sends true or false.
+function toTask(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    done: row.done === 1
+  };
 }
 
 function isValidTitle(title) {
@@ -154,15 +172,16 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/tasks", (req, res) => {
-  res.status(200).json(tasks);
+  const rows = selectAllTasks.all();
+  res.status(200).json(rows.map(toTask));
 });
 
 app.get("/tasks/:id", (req, res) => {
-  const task = findTask(req.params.id);
-  if (!task) {
-    return res.status(404).json({ error: "Task " + req.params.id + " not found" });
+  const row = selectTaskById.get(req.params.id);
+  if (!row) {
+    return res.status(404).json({ error: "Task not found" });
   }
-  res.status(200).json(task);
+  res.status(200).json(toTask(row));
 });
 
 app.post("/tasks", (req, res) => {
@@ -170,19 +189,16 @@ app.post("/tasks", (req, res) => {
   if (!isValidTitle(body.title)) {
     return res.status(400).json({ error: "Title is required" });
   }
-  const newTask = {
-    id: getNextId(),
-    title: body.title,
-    done: false
-  };
-  tasks.push(newTask);
-  res.status(201).json(newTask);
+
+  const result = insertTask.run(body.title);
+  const row = selectTaskById.get(result.lastInsertRowid);
+  res.status(201).json(toTask(row));
 });
 
 app.put("/tasks/:id", (req, res) => {
-  const task = findTask(req.params.id);
-  if (!task) {
-    return res.status(404).json({ error: "Task " + req.params.id + " not found" });
+  const row = selectTaskById.get(req.params.id);
+  if (!row) {
+    return res.status(404).json({ error: "Task not found" });
   }
 
   const body = req.body || {};
@@ -199,21 +215,21 @@ app.put("/tasks/:id", (req, res) => {
     return res.status(400).json({ error: "Invalid update data" });
   }
 
-  if (hasTitle) {
-    task.title = body.title;
-  }
-  if (hasDone) {
-    task.done = body.done;
-  }
-  res.status(200).json(task);
+  // Keep the current value for any field the request left out.
+  const newTitle = hasTitle ? body.title : row.title;
+  const newDone = hasDone ? (body.done ? 1 : 0) : row.done;
+
+  updateTask.run(newTitle, newDone, row.id);
+
+  const updatedRow = selectTaskById.get(row.id);
+  res.status(200).json(toTask(updatedRow));
 });
 
 app.delete("/tasks/:id", (req, res) => {
-  const task = findTask(req.params.id);
-  if (!task) {
-    return res.status(404).json({ error: "Task " + req.params.id + " not found" });
+  const result = deleteTask.run(req.params.id);
+  if (result.changes === 0) {
+    return res.status(404).json({ error: "Task not found" });
   }
-  tasks = tasks.filter((item) => item.id !== task.id);
   res.status(204).send();
 });
 
