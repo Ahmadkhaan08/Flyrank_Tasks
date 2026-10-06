@@ -339,7 +339,15 @@ const swaggerDocument = {
   }
 };
 
-app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerDocument));
+// persistAuthorization keeps the token you paste into "Authorize"
+// after a page refresh, so you do not have to paste it again.
+app.use(
+  "/docs",
+  swaggerUi.serve,
+  swaggerUi.setup(swaggerDocument, {
+    swaggerOptions: { persistAuthorization: true }
+  })
+);
 
 // Routes
 app.get("/", (req, res) => {
