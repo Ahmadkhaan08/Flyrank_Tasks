@@ -159,14 +159,16 @@ const swaggerDocument = {
     },
     "/protected/profile": {
       get: {
-        summary: "Checks the Authorization header only (no verification yet)",
+        summary: "Returns the signed-in user, verified by Supabase",
         // Tells Swagger UI to send the token from its "Authorize" button.
         // A plain header parameter named "Authorization" does NOT work here:
         // the OpenAPI rules say such a parameter must be ignored.
         security: [{ bearerAuth: [] }],
         responses: {
-          200: { description: "Token detected, verification pending" },
-          401: { description: "Access token required" }
+          200: { description: "The authenticated user's id, email and created_at" },
+          401: {
+            description: "Access token required, or Invalid or expired token"
+          }
         }
       }
     },
@@ -340,7 +342,7 @@ app.get("/public/info", (req, res) => {
 // This step only checks that the header is present and shaped correctly.
 // It does NOT ask Supabase whether the token is real, so any text after
 // "Bearer " is accepted for now. Verification comes in the next step.
-app.get("/protected/profile", (req, res) => {
+app.get("/protected/profile", async (req, res) => {
   // Node puts every header name in lower case, so "Authorization"
   // is read as req.headers.authorization.
   const authHeader = req.headers.authorization;
@@ -368,7 +370,27 @@ app.get("/protected/profile", (req, res) => {
     return res.status(401).json({ error: "Access token required" });
   }
 
-  res.status(200).json({ message: "Token detected, verification pending" });
+  // Hand the token to Supabase. It checks the signature and the expiry
+  // date for us, so we never decode or verify the token ourselves.
+  const { data, error } = await supabase.auth.getUser(token);
+
+  // A tampered, expired, or made-up token lands here.
+  if (error || !data.user) {
+    console.error(
+      "Token rejected by Supabase:",
+      error ? error.message : "no user returned"
+    );
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+
+  // Send back only these three fields. The full user object holds
+  // more than a client needs to see.
+  const user = data.user;
+  res.status(200).json({
+    id: user.id,
+    email: user.email,
+    created_at: user.created_at
+  });
 });
 
 app.get("/tasks", (req, res) => {
