@@ -1,9 +1,32 @@
+// Load the variables from .env into process.env.
+// This must run before we read any of them.
+// quiet: true stops dotenv from printing its own startup banner.
+require("dotenv").config({ quiet: true });
+
 const express = require("express");
 const swaggerUi = require("swagger-ui-express");
 const Database = require("better-sqlite3");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(express.json());
+
+// Settings come from the environment, never hard-coded here.
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
+const port = process.env.PORT || 3000;
+
+// Stop early with a clear message if the credentials are missing,
+// instead of failing later with a confusing error.
+if (!supabaseUrl || !supabaseKey) {
+  console.error("Missing SUPABASE_URL or SUPABASE_KEY.");
+  console.error("Copy .env.example to .env and fill in your values.");
+  process.exit(1);
+}
+
+// Initialize the Supabase client.
+// The tasks below still use SQLite; this client is ready for the next step.
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Database setup
 // Opens tasks.db, or creates the file if it does not exist yet.
@@ -52,7 +75,7 @@ function isValidTitle(title) {
 const swaggerDocument = {
   openapi: "3.0.0",
   info: { title: "Task API", version: "1.0" },
-  servers: [{ url: "http://localhost:3000" }],
+  servers: [{ url: "http://localhost:" + port }],
   paths: {
     "/": {
       get: {
@@ -233,7 +256,8 @@ app.delete("/tasks/:id", (req, res) => {
   res.status(204).send();
 });
 
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
-  console.log("Docs available at http://localhost:3000/docs");
+app.listen(port, () => {
+  console.log("Server running and connected to Supabase");
+  console.log("Server running on http://localhost:" + port);
+  console.log("Docs available at http://localhost:" + port + "/docs");
 });
