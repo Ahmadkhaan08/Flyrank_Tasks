@@ -25,7 +25,7 @@ if (!supabaseUrl || !supabaseKey) {
 }
 
 // Initialize the Supabase client.
-// The tasks below still use SQLite; this client is ready for the next step.
+// The auth routes use this; the task routes still use SQLite.
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 // Database setup
@@ -67,8 +67,10 @@ function toTask(row) {
   };
 }
 
-function isValidTitle(title) {
-  return typeof title === "string" && title.trim() !== "";
+// True only for a real string with something other than spaces in it.
+// Used for titles, emails and passwords.
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim() !== "";
 }
 
 // Swagger documentation
@@ -87,6 +89,55 @@ const swaggerDocument = {
       get: {
         summary: "Health check",
         responses: { 200: { description: "Server is healthy" } }
+      }
+    },
+    "/auth/signup": {
+      post: {
+        summary: "Register a new user",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["email", "password"],
+                properties: {
+                  email: { type: "string", example: "test@example.com" },
+                  password: { type: "string", example: "secret123" }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          201: { description: "User created" },
+          400: { description: "Missing fields or Supabase rejected the signup" }
+        }
+      }
+    },
+    "/auth/login": {
+      post: {
+        summary: "Log in and receive tokens",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["email", "password"],
+                properties: {
+                  email: { type: "string", example: "test@example.com" },
+                  password: { type: "string", example: "secret123" }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          200: { description: "Access and refresh tokens" },
+          400: { description: "Email and password are required" },
+          401: { description: "Invalid login credentials" }
+        }
       }
     },
     "/tasks": {
@@ -194,6 +245,61 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
+// Auth routes
+// Supabase handles the password hashing and stores the user, so we never do.
+// These handlers are "async" because waiting on Supabase takes a moment,
+// and "await" pauses until the answer comes back.
+app.post("/auth/signup", async (req, res) => {
+  const body = req.body || {};
+
+  if (!isNonEmptyString(body.email) || !isNonEmptyString(body.password)) {
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+
+  // Trim the email so a stray space from copy-paste does not
+  // create an account you cannot log in to afterwards.
+  // The password is never trimmed, because spaces can be part of it.
+  const { data, error } = await supabase.auth.signUp({
+    email: body.email.trim(),
+    password: body.password
+  });
+
+  // Supabase reports problems in "error" instead of crashing,
+  // for example a weak password or an email already in use.
+  if (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
+  res.status(201).json(data.user);
+});
+
+app.post("/auth/login", async (req, res) => {
+  const body = req.body || {};
+
+  if (!isNonEmptyString(body.email) || !isNonEmptyString(body.password)) {
+    return res.status(400).json({ error: "Email and password are required" });
+  }
+
+  // Trimmed the same way as signup, so both look up the same account.
+  const { data, error } = await supabase.auth.signInWithPassword({
+    email: body.email.trim(),
+    password: body.password
+  });
+
+  // Keep the reply vague on purpose. Saying which half was wrong
+  // would tell a stranger whether that email has an account.
+  // The real reason is printed in the terminal so you can debug it.
+  if (error) {
+    console.error("Login failed:", error.message);
+    return res.status(401).json({ error: "Invalid login credentials" });
+  }
+
+  res.status(200).json({
+    access_token: data.session.access_token,
+    refresh_token: data.session.refresh_token
+  });
+});
+
 app.get("/tasks", (req, res) => {
   const rows = selectAllTasks.all();
   res.status(200).json(rows.map(toTask));
@@ -209,7 +315,7 @@ app.get("/tasks/:id", (req, res) => {
 
 app.post("/tasks", (req, res) => {
   const body = req.body || {};
-  if (!isValidTitle(body.title)) {
+  if (!isNonEmptyString(body.title)) {
     return res.status(400).json({ error: "Title is required" });
   }
 
@@ -231,7 +337,7 @@ app.put("/tasks/:id", (req, res) => {
   if (!hasTitle && !hasDone) {
     return res.status(400).json({ error: "Invalid update data" });
   }
-  if (hasTitle && !isValidTitle(body.title)) {
+  if (hasTitle && !isNonEmptyString(body.title)) {
     return res.status(400).json({ error: "Invalid update data" });
   }
   if (hasDone && typeof body.done !== "boolean") {
