@@ -78,6 +78,17 @@ const swaggerDocument = {
   openapi: "3.0.0",
   info: { title: "Task API", version: "1.0" },
   servers: [{ url: "http://localhost:" + port }],
+  // Defines the "Authorize" button in /docs. Paste only the token there;
+  // Swagger UI adds the "Bearer " prefix for you.
+  components: {
+    securitySchemes: {
+      bearerAuth: {
+        type: "http",
+        scheme: "bearer",
+        bearerFormat: "JWT"
+      }
+    }
+  },
   paths: {
     "/": {
       get: {
@@ -137,6 +148,25 @@ const swaggerDocument = {
           200: { description: "Access and refresh tokens" },
           400: { description: "Email and password are required" },
           401: { description: "Invalid login credentials" }
+        }
+      }
+    },
+    "/public/info": {
+      get: {
+        summary: "Public info, no token needed",
+        responses: { 200: { description: "Public message" } }
+      }
+    },
+    "/protected/profile": {
+      get: {
+        summary: "Checks the Authorization header only (no verification yet)",
+        // Tells Swagger UI to send the token from its "Authorize" button.
+        // A plain header parameter named "Authorization" does NOT work here:
+        // the OpenAPI rules say such a parameter must be ignored.
+        security: [{ bearerAuth: [] }],
+        responses: {
+          200: { description: "Token detected, verification pending" },
+          401: { description: "Access token required" }
         }
       }
     },
@@ -298,6 +328,47 @@ app.post("/auth/login", async (req, res) => {
     access_token: data.session.access_token,
     refresh_token: data.session.refresh_token
   });
+});
+
+// Public route
+// Anyone can call this. No header needed.
+app.get("/public/info", (req, res) => {
+  res.status(200).json({ message: "Welcome stranger! This info is public." });
+});
+
+// Protected route (guard not finished yet)
+// This step only checks that the header is present and shaped correctly.
+// It does NOT ask Supabase whether the token is real, so any text after
+// "Bearer " is accepted for now. Verification comes in the next step.
+app.get("/protected/profile", (req, res) => {
+  // Node puts every header name in lower case, so "Authorization"
+  // is read as req.headers.authorization.
+  const authHeader = req.headers.authorization;
+
+  // The header must exist and start with exactly "Bearer ".
+  if (!isNonEmptyString(authHeader) || !authHeader.startsWith("Bearer ")) {
+    // Print the start of what arrived, so a wrong shape is easy to spot.
+    // Only the first 15 characters are logged, to keep the token private.
+    console.error(
+      "Auth header rejected. Expected it to start with 'Bearer ' but got:",
+      isNonEmptyString(authHeader)
+        ? JSON.stringify(authHeader.slice(0, 15) + "...")
+        : "(no Authorization header at all)"
+    );
+    // Listing the header names that did arrive shows whether the request
+    // carried a misspelled one, such as "'authorization" from bad quoting.
+    console.error("Headers this request did send:", Object.keys(req.headers).join(", "));
+    return res.status(401).json({ error: "Access token required" });
+  }
+
+  // Whatever follows "Bearer " is the token, and it must not be blank.
+  const token = authHeader.slice("Bearer ".length).trim();
+  if (token === "") {
+    console.error("Auth header rejected: 'Bearer' was sent with no token after it.");
+    return res.status(401).json({ error: "Access token required" });
+  }
+
+  res.status(200).json({ message: "Token detected, verification pending" });
 });
 
 app.get("/tasks", (req, res) => {
