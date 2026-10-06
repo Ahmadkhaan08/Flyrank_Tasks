@@ -73,6 +73,59 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.trim() !== "";
 }
 
+// Auth guard
+// Put this in front of any route that needs a signed-in user:
+//   app.get("/some/route", requireAuth, (req, res) => { ... });
+// It checks the token once, here, so no route repeats the work.
+// On success it saves the user as req.user and calls next() to let the
+// route run. On failure it answers with 401 and next() is never called,
+// so the route handler does not run at all.
+async function requireAuth(req, res, next) {
+  // Node puts every header name in lower case, so "Authorization"
+  // is read as req.headers.authorization.
+  const authHeader = req.headers.authorization;
+
+  // The header must exist and start with exactly "Bearer ".
+  if (!isNonEmptyString(authHeader) || !authHeader.startsWith("Bearer ")) {
+    // Print the start of what arrived, so a wrong shape is easy to spot.
+    // Only the first 15 characters are logged, to keep the token private.
+    console.error(
+      "Auth header rejected. Expected it to start with 'Bearer ' but got:",
+      isNonEmptyString(authHeader)
+        ? JSON.stringify(authHeader.slice(0, 15) + "...")
+        : "(no Authorization header at all)"
+    );
+    // Listing the header names that did arrive shows whether the request
+    // carried a misspelled one, such as "'authorization" from bad quoting.
+    console.error("Headers this request did send:", Object.keys(req.headers).join(", "));
+    return res.status(401).json({ error: "Access token required" });
+  }
+
+  // Whatever follows "Bearer " is the token, and it must not be blank.
+  const token = authHeader.slice("Bearer ".length).trim();
+  if (token === "") {
+    console.error("Auth header rejected: 'Bearer' was sent with no token after it.");
+    return res.status(401).json({ error: "Access token required" });
+  }
+
+  // Hand the token to Supabase. It checks the signature and the expiry
+  // date for us, so we never decode or verify the token ourselves.
+  const { data, error } = await supabase.auth.getUser(token);
+
+  // A tampered, expired, or made-up token lands here.
+  if (error || !data.user) {
+    console.error(
+      "Token rejected by Supabase:",
+      error ? error.message : "no user returned"
+    );
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+
+  // Save the verified user so the route handler can use it.
+  req.user = data.user;
+  next();
+}
+
 // Swagger documentation
 const swaggerDocument = {
   openapi: "3.0.0",
@@ -166,6 +219,30 @@ const swaggerDocument = {
         security: [{ bearerAuth: [] }],
         responses: {
           200: { description: "The authenticated user's id, email and created_at" },
+          401: {
+            description: "Access token required, or Invalid or expired token"
+          }
+        }
+      }
+    },
+    "/protected/dashboard": {
+      get: {
+        summary: "Dashboard greeting for the signed-in user",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          200: { description: "Welcome message and user id" },
+          401: {
+            description: "Access token required, or Invalid or expired token"
+          }
+        }
+      }
+    },
+    "/auth/logout": {
+      post: {
+        summary: "Sign out",
+        security: [{ bearerAuth: [] }],
+        responses: {
+          204: { description: "Signed out (empty body)" },
           401: {
             description: "Access token required, or Invalid or expired token"
           }
@@ -342,55 +419,36 @@ app.get("/public/info", (req, res) => {
 // This step only checks that the header is present and shaped correctly.
 // It does NOT ask Supabase whether the token is real, so any text after
 // "Bearer " is accepted for now. Verification comes in the next step.
-app.get("/protected/profile", async (req, res) => {
-  // Node puts every header name in lower case, so "Authorization"
-  // is read as req.headers.authorization.
-  const authHeader = req.headers.authorization;
-
-  // The header must exist and start with exactly "Bearer ".
-  if (!isNonEmptyString(authHeader) || !authHeader.startsWith("Bearer ")) {
-    // Print the start of what arrived, so a wrong shape is easy to spot.
-    // Only the first 15 characters are logged, to keep the token private.
-    console.error(
-      "Auth header rejected. Expected it to start with 'Bearer ' but got:",
-      isNonEmptyString(authHeader)
-        ? JSON.stringify(authHeader.slice(0, 15) + "...")
-        : "(no Authorization header at all)"
-    );
-    // Listing the header names that did arrive shows whether the request
-    // carried a misspelled one, such as "'authorization" from bad quoting.
-    console.error("Headers this request did send:", Object.keys(req.headers).join(", "));
-    return res.status(401).json({ error: "Access token required" });
-  }
-
-  // Whatever follows "Bearer " is the token, and it must not be blank.
-  const token = authHeader.slice("Bearer ".length).trim();
-  if (token === "") {
-    console.error("Auth header rejected: 'Bearer' was sent with no token after it.");
-    return res.status(401).json({ error: "Access token required" });
-  }
-
-  // Hand the token to Supabase. It checks the signature and the expiry
-  // date for us, so we never decode or verify the token ourselves.
-  const { data, error } = await supabase.auth.getUser(token);
-
-  // A tampered, expired, or made-up token lands here.
-  if (error || !data.user) {
-    console.error(
-      "Token rejected by Supabase:",
-      error ? error.message : "no user returned"
-    );
-    return res.status(401).json({ error: "Invalid or expired token" });
-  }
-
+// requireAuth runs first. If it answers 401, these handlers never run,
+// so inside them req.user is always a verified user.
+app.get("/protected/profile", requireAuth, (req, res) => {
   // Send back only these three fields. The full user object holds
   // more than a client needs to see.
-  const user = data.user;
   res.status(200).json({
-    id: user.id,
-    email: user.email,
-    created_at: user.created_at
+    id: req.user.id,
+    email: req.user.email,
+    created_at: req.user.created_at
   });
+});
+
+app.get("/protected/dashboard", requireAuth, (req, res) => {
+  res.status(200).json({
+    message: "Welcome to dashboard",
+    user_id: req.user.id
+  });
+});
+
+app.post("/auth/logout", requireAuth, async (req, res) => {
+  const { error } = await supabase.auth.signOut();
+
+  // Log a problem but still answer 204: from the caller's point of view
+  // the logout is done either way.
+  if (error) {
+    console.error("Logout reported a problem:", error.message);
+  }
+
+  // 204 means "done, and there is nothing to send back".
+  res.status(204).send();
 });
 
 app.get("/tasks", (req, res) => {
