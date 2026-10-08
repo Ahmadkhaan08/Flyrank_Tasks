@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Python virtual environments / bytecode
+venv/
+__pycache__/
+
+# Scraper working folders
+cache/
+output/
+
+# Environment variables
+.env
+
+# Logs
+*.log
