@@ -2,6 +2,9 @@
 // Scope: the first 3 catalogue pages only (60 books).
 // Steps: crawl the catalogue, read 8 fields per book, clean and check them,
 // then save the good records to output/books.json.
+//
+// Run normally:        npm start
+// Test a broken page:  npm start -- --inject-failure
 
 const fs = require("fs");
 const path = require("path");
@@ -23,6 +26,9 @@ const TIMEOUT_MS = Number(process.env.TIMEOUT_MS) || 10000;
 const MIN_DELAY_MS = 500;
 const DELAY_MS = Math.max(MIN_DELAY_MS, Number(process.env.DELAY_MS) || 2000);
 
+// How long to wait before the single retry attempt.
+const RETRY_WAIT_MS = 1000;
+
 // Stop after this many catalogue pages. This is the whole agreed scope.
 const MAX_PAGES = 3;
 
@@ -31,6 +37,24 @@ const CACHE_DIR = path.join(__dirname, "..", "cache");
 const OUTPUT_DIR = path.join(__dirname, "..", "output");
 const BOOKS_FILE = path.join(OUTPUT_DIR, "books.json");
 const ERRORS_FILE = path.join(OUTPUT_DIR, "errors.json");
+const REPORT_FILE = path.join(OUTPUT_DIR, "run-report.json");
+
+// A URL that does not exist, used only to prove the pipeline survives a bad page.
+const FAKE_URL = "https://books.toscrape.com/catalogue/non-existent-book.html";
+
+// "--inject-failure" adds one broken URL to the book list on purpose.
+const INJECT_FAILURE = process.argv.includes("--inject-failure");
+
+// Counters for the run report. They are filled in as the script works.
+const metrics = {
+  start_time: new Date().toISOString(),
+  duration_seconds: 0,
+  pages_fetched: 0,
+  cache_hits: 0,
+  valid_records: 0,
+  invalid_records: 0,
+  failed_pages: 0,
+};
 
 // The shape every record must have before it is allowed into books.json.
 const bookSchema = z.object({
@@ -79,9 +103,15 @@ function parsePriceToNumber(priceText) {
 // ".../catalogue/a-light-in-the-attic_1000/index.html" -> "a-light-in-the-attic_1000"
 function bookIdFromUrl(url) {
   const parts = new URL(url).pathname.split("/");
+  const lastPart = parts[parts.length - 1];
 
-  // The last part is "index.html", so the book folder is the one before it.
-  return parts[parts.length - 2];
+  // Normal book URLs end with "/index.html", so the folder before it is the id.
+  if (lastPart === "index.html") {
+    return parts[parts.length - 2];
+  }
+
+  // Any other shape (such as a test URL) uses the file name without ".html".
+  return lastPart.replace(/\.html$/, "");
 }
 
 // Returns { html, fromCache, fetchedAt } for a URL, using the cache when possible.
@@ -93,11 +123,14 @@ async function fetchWithCache(url, cacheFilePath) {
     const cachedHtml = fs.readFileSync(cacheFilePath, "utf8");
     const savedAt = fs.statSync(cacheFilePath).mtime.toISOString();
 
+    metrics.cache_hits++;
     console.log("[CACHE HIT] " + url + " (" + Buffer.byteLength(cachedHtml) + " bytes)");
     return { html: cachedHtml, fromCache: true, fetchedAt: savedAt };
   }
 
   // 2. No saved copy, so download the page.
+  metrics.pages_fetched++;
+
   let response;
   try {
     response = await fetch(url, {
@@ -105,15 +138,22 @@ async function fetchWithCache(url, cacheFilePath) {
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
   } catch (error) {
+    // A timeout is worth one retry, so mark it for the retry helper.
     if (error.name === "TimeoutError") {
-      throw new Error("Request timed out after " + TIMEOUT_MS + "ms: " + url);
+      const timeoutError = new Error("Request timed out after " + TIMEOUT_MS + "ms: " + url);
+      timeoutError.isTimeout = true;
+      throw timeoutError;
     }
+
     throw new Error("Request failed for " + url + ": " + error.message);
   }
 
-  // 3. Only a 200 response is treated as usable HTML.
+  // 3. Only a 200 response is treated as usable HTML. The status is kept on the
+  //    error so the retry helper can tell a 404 apart from a 503.
   if (response.status !== 200) {
-    throw new Error("Expected status 200 but got " + response.status + " for " + url);
+    const statusError = new Error("Expected status 200 but got " + response.status + " for " + url);
+    statusError.status = response.status;
+    throw statusError;
   }
 
   const html = await response.text();
@@ -124,6 +164,39 @@ async function fetchWithCache(url, cacheFilePath) {
 
   console.log("[FETCH] " + url + " (" + Buffer.byteLength(html) + " bytes)");
   return { html, fromCache: false, fetchedAt: new Date().toISOString() };
+}
+
+// Decides whether a failed request deserves one more try.
+// Only timeouts and 5xx server errors do. A 404 or 403 is a real answer,
+// so asking again would just waste the server's time.
+function shouldRetry(error) {
+  if (error.isTimeout === true) {
+    return true;
+  }
+
+  if (typeof error.status === "number" && error.status >= 500 && error.status <= 599) {
+    return true;
+  }
+
+  return false;
+}
+
+// Calls fetchWithCache and, for a timeout or 5xx only, tries one more time.
+async function fetchWithRetry(url, cacheFilePath) {
+  try {
+    return await fetchWithCache(url, cacheFilePath);
+  } catch (error) {
+    if (!shouldRetry(error)) {
+      // Not a retryable problem, so hand the error straight to the caller.
+      throw error;
+    }
+
+    console.log("[RETRY] " + url + " in " + RETRY_WAIT_MS + "ms (" + error.message + ")");
+    await sleep(RETRY_WAIT_MS);
+
+    // This is the one and only retry. If it fails, the error goes up.
+    return await fetchWithCache(url, cacheFilePath);
+  }
 }
 
 // Finds every book detail link on a catalogue page.
@@ -229,7 +302,20 @@ async function crawlCatalogue() {
     const pageNumber = cataloguePages + 1;
     const cacheFilePath = path.join(CACHE_DIR, "catalogue-page-" + pageNumber + ".html");
 
-    const result = await fetchWithCache(currentUrl, cacheFilePath);
+    let result;
+
+    // One unreachable catalogue page must not crash the whole run.
+    try {
+      result = await fetchWithRetry(currentUrl, cacheFilePath);
+    } catch (error) {
+      metrics.failed_pages++;
+      console.log("[FAILED] " + currentUrl + " - " + error.message);
+
+      // Without this page we cannot read its "next" link, so stop crawling
+      // and work with the books found so far.
+      break;
+    }
+
     cataloguePages++;
 
     // Hand the HTML to Cheerio so we can search it with CSS selectors.
@@ -258,6 +344,12 @@ async function crawlCatalogue() {
     currentUrl = hasAnotherPageToFetch ? nextUrl : null;
   }
 
+  // The test flag adds a URL that is known to be missing.
+  if (INJECT_FAILURE) {
+    discoveredBooks.set(FAKE_URL, "(injected by --inject-failure)");
+    console.log("[TEST] added one broken URL on purpose: " + FAKE_URL);
+  }
+
   console.log(
     "catalogue_pages = " + cataloguePages +
     ", discovered = " + discovered +
@@ -268,6 +360,7 @@ async function crawlCatalogue() {
 }
 
 // Visits every book page and returns one cleaned record per book.
+// A book that cannot be fetched or read is counted and skipped.
 async function scrapeBookPages(discoveredBooks) {
   const records = [];
   const bookEntries = Array.from(discoveredBooks.entries());
@@ -279,13 +372,24 @@ async function scrapeBookPages(discoveredBooks) {
     const bookId = bookIdFromUrl(productUrl);
     const cacheFilePath = path.join(CACHE_DIR, "book-" + bookId + ".html");
 
-    const result = await fetchWithCache(productUrl, cacheFilePath);
-    records.push(extractBookRecord(result.html, productUrl, sourcePage, result.fetchedAt));
+    // Assume the network was used, unless a cache hit proves otherwise.
+    let usedNetwork = true;
+
+    // Each book is handled on its own, so one bad page cannot stop the rest.
+    try {
+      const result = await fetchWithRetry(productUrl, cacheFilePath);
+      usedNetwork = result.fromCache === false;
+
+      records.push(extractBookRecord(result.html, productUrl, sourcePage, result.fetchedAt));
+    } catch (error) {
+      metrics.failed_pages++;
+      console.log("[FAILED] " + productUrl + " - " + error.message);
+    }
 
     // Pause before the next live request, but not after the last book
     // and not after a cache hit.
     const isLastBook = index === bookEntries.length - 1;
-    if (!isLastBook && result.fromCache === false) {
+    if (!isLastBook && usedNetwork) {
       await sleep(DELAY_MS);
     }
   }
@@ -324,33 +428,41 @@ function validateRecords(records) {
 function writeJsonFile(filePath, data) {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf8");
-  console.log("wrote " + path.basename(filePath) + " (" + data.length + " records)");
+
+  const size = Array.isArray(data) ? data.length + " records" : "report";
+  console.log("wrote " + path.basename(filePath) + " (" + size + ")");
+}
+
+// Fills in the final numbers and saves the run report.
+function writeRunReport(startedAtMs) {
+  metrics.duration_seconds = Number(((Date.now() - startedAtMs) / 1000).toFixed(2));
+  writeJsonFile(REPORT_FILE, metrics);
 }
 
 async function main() {
-  const discoveredBooks = await crawlCatalogue();
-  const records = await scrapeBookPages(discoveredBooks);
+  const startedAtMs = Date.now();
 
-  console.log("detail_pages = " + records.length);
+  // The report is written even if something unexpected goes wrong.
+  try {
+    const discoveredBooks = await crawlCatalogue();
+    const records = await scrapeBookPages(discoveredBooks);
 
-  const checked = validateRecords(records);
+    console.log("detail_pages = " + records.length);
 
-  // Both files are rewritten every run, so old results never pile up.
-  writeJsonFile(BOOKS_FILE, checked.validRecords);
-  writeJsonFile(ERRORS_FILE, checked.invalidRecords);
+    const checked = validateRecords(records);
+    metrics.valid_records = checked.validRecords.length;
+    metrics.invalid_records = checked.invalidRecords.length;
 
-  // Show one whole record so the field shapes are easy to check.
-  if (checked.validRecords.length > 0) {
-    console.log("");
-    console.log("Sample valid record:");
-    console.log(JSON.stringify(checked.validRecords[0], null, 2));
+    // Both files are rewritten every run, so old results never pile up.
+    writeJsonFile(BOOKS_FILE, checked.validRecords);
+    writeJsonFile(ERRORS_FILE, checked.invalidRecords);
+  } finally {
+    writeRunReport(startedAtMs);
   }
 
   console.log("");
-  console.log(
-    "valid = " + checked.validRecords.length +
-    ", invalid = " + checked.invalidRecords.length
-  );
+  console.log("Run report:");
+  console.log(JSON.stringify(metrics, null, 2));
 }
 
 main().catch(function (error) {

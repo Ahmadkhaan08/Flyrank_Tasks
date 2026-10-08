@@ -72,8 +72,9 @@ scraper/
 ├── package.json
 ├── cache/            (created at runtime, not committed)
 ├── output/           (created at runtime, not committed)
-│   ├── books.json    (valid records)
-│   └── errors.json   (rejected records and the reason)
+│   ├── books.json       (valid records)
+│   ├── errors.json      (rejected records and the reason)
+│   └── run-report.json  (counts and timings)
 └── src/
     └── index.js
 ```
@@ -87,6 +88,10 @@ gives the same 60 records instead of adding duplicates.
 | ---- | -------- |
 | `output/books.json` | Records that passed the schema |
 | `output/errors.json` | Records that failed, with the validation reason |
+| `output/run-report.json` | Counts and timings for the run |
+
+`run-report.json` holds `start_time`, `duration_seconds`, `pages_fetched`,
+`cache_hits`, `valid_records`, `invalid_records` and `failed_pages`.
 
 ## Requirements
 
@@ -105,6 +110,25 @@ cp .env.example .env
 ```bash
 npm start
 ```
+
+## Failure handling
+
+Each page is fetched inside its own `try` / `catch`, so one unreachable page is
+counted and skipped instead of stopping the run.
+
+| Problem | What happens |
+| ------- | ------------ |
+| Timeout | Wait 1 second, try once more, then give up |
+| 5xx server error | Wait 1 second, try once more, then give up |
+| 404 or 403 | No retry. The server already gave a clear answer |
+
+To see this working, add one URL that does not exist:
+
+```bash
+npm run test:failure
+```
+
+That run keeps all 60 valid records and reports `failed_pages: 1`.
 
 ## Dependencies
 
