@@ -1,10 +1,12 @@
 // Polite scraper for https://books.toscrape.com
 // Scope: the first 3 catalogue pages only (60 books).
-// Steps: crawl the catalogue, then visit every book page and read 8 fields.
+// Steps: crawl the catalogue, read 8 fields per book, clean and check them,
+// then save the good records to output/books.json.
 
 const fs = require("fs");
 const path = require("path");
 const cheerio = require("cheerio");
+const { z } = require("zod");
 
 // Load the settings from the .env file sitting next to this project.
 const ENV_FILE = path.join(__dirname, "..", ".env");
@@ -24,8 +26,24 @@ const DELAY_MS = Math.max(MIN_DELAY_MS, Number(process.env.DELAY_MS) || 2000);
 // Stop after this many catalogue pages. This is the whole agreed scope.
 const MAX_PAGES = 3;
 
-// The cache folder lives next to the scraper folder, not inside src/.
+// These folders live next to the scraper folder, not inside src/.
 const CACHE_DIR = path.join(__dirname, "..", "cache");
+const OUTPUT_DIR = path.join(__dirname, "..", "output");
+const BOOKS_FILE = path.join(OUTPUT_DIR, "books.json");
+const ERRORS_FILE = path.join(OUTPUT_DIR, "errors.json");
+
+// The shape every record must have before it is allowed into books.json.
+const bookSchema = z.object({
+  title: z.string().min(1),
+  product_url: z.string().url().startsWith("https://"),
+  price_text: z.string().min(1),
+  price_gbp: z.number().positive(),
+  availability_text: z.string().min(1),
+  rating_text: z.string().min(1),
+  description: z.string().nullable(),
+  source_page: z.string().min(1),
+  fetched_at: z.string().min(1),
+});
 
 // Waits for the given number of milliseconds.
 function sleep(ms) {
@@ -41,6 +59,20 @@ function cleanText(value) {
 
   const cleaned = value.replace(/\s+/g, " ").trim();
   return cleaned === "" ? null : cleaned;
+}
+
+// Reads the number out of a price string: "£51.77" -> 51.77
+// Returns null when there is no number, so a bad price is never guessed.
+function parsePriceToNumber(priceText) {
+  if (typeof priceText !== "string") {
+    return null;
+  }
+
+  // Keep only digits and the decimal point, dropping "£" and any spaces.
+  const digitsOnly = priceText.replace(/[^0-9.]/g, "");
+  const price = parseFloat(digitsOnly);
+
+  return Number.isFinite(price) ? price : null;
 }
 
 // Builds the cache file name for a book from the last part of its URL.
@@ -128,8 +160,10 @@ function findNextPageUrl($, pageUrl) {
 
 // Reads the rating word out of the class list, for example:
 // class="star-rating Three" -> "Three"
+// Only div.product_main is searched, because the "you may also like" row
+// further down the page has star ratings for other books.
 function extractRatingText($) {
-  const classList = $("article.product_page p.star-rating").attr("class");
+  const classList = $("article.product_page div.product_main p.star-rating").attr("class");
 
   if (!classList) {
     return null;
@@ -154,16 +188,26 @@ function extractDescription($) {
   return cleanText(paragraph.text());
 }
 
-// Pulls the 8 raw fields out of one book detail page.
+// Pulls the raw fields out of one book detail page and cleans them.
 function extractBookRecord(html, productUrl, sourcePage, fetchedAt) {
   const $ = cheerio.load(html);
-  const product = $("article.product_page");
+
+  // div.product_main holds this book's own details. The rest of the page has a
+  // "you may also like" row whose books also use p.price_color and p.instock,
+  // so searching the whole page could pick up the wrong book's values.
+  const product = $("article.product_page div.product_main");
+
+  // cleanText() already removes the extra spaces and newlines from the HTML.
+  const title = cleanText(product.find("h1").first().text());
+  const priceText = cleanText(product.find("p.price_color").first().text());
+  const availabilityText = cleanText(product.find("p.instock.availability").first().text());
 
   return {
-    title: cleanText(product.find("h1").first().text()),
+    title: title,
     product_url: productUrl,
-    price_text: cleanText(product.find("p.price_color").first().text()),
-    availability_text: cleanText(product.find("p.instock.availability").first().text()),
+    price_text: priceText,
+    price_gbp: parsePriceToNumber(priceText),
+    availability_text: availabilityText,
     rating_text: extractRatingText($),
     description: extractDescription($),
     source_page: sourcePage,
@@ -223,7 +267,7 @@ async function crawlCatalogue() {
   return discoveredBooks;
 }
 
-// Visits every book page and returns one raw record per book.
+// Visits every book page and returns one cleaned record per book.
 async function scrapeBookPages(discoveredBooks) {
   const records = [];
   const bookEntries = Array.from(discoveredBooks.entries());
@@ -249,16 +293,64 @@ async function scrapeBookPages(discoveredBooks) {
   return records;
 }
 
+// Checks every record against the schema and splits them into two lists.
+// Nothing that fails the schema can reach the valid list.
+function validateRecords(records) {
+  const validRecords = [];
+  const invalidRecords = [];
+
+  for (const record of records) {
+    const result = bookSchema.safeParse(record);
+
+    if (result.success) {
+      validRecords.push(result.data);
+      continue;
+    }
+
+    // Turn Zod's issue list into short, readable reasons.
+    const reasons = result.error.issues.map(function (issue) {
+      const fieldName = issue.path.join(".") || "(record)";
+      return fieldName + ": " + issue.message;
+    });
+
+    invalidRecords.push({ record: record, errors: reasons });
+  }
+
+  return { validRecords, invalidRecords };
+}
+
+// Writes pretty JSON to a file, replacing whatever was there before.
+// Overwriting is what makes repeated runs safe to do.
+function writeJsonFile(filePath, data) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf8");
+  console.log("wrote " + path.basename(filePath) + " (" + data.length + " records)");
+}
+
 async function main() {
   const discoveredBooks = await crawlCatalogue();
   const records = await scrapeBookPages(discoveredBooks);
 
-  // Show one whole record so the field shapes are easy to check.
-  console.log("");
-  console.log("Sample raw record:");
-  console.log(JSON.stringify(records[0], null, 2));
-  console.log("");
   console.log("detail_pages = " + records.length);
+
+  const checked = validateRecords(records);
+
+  // Both files are rewritten every run, so old results never pile up.
+  writeJsonFile(BOOKS_FILE, checked.validRecords);
+  writeJsonFile(ERRORS_FILE, checked.invalidRecords);
+
+  // Show one whole record so the field shapes are easy to check.
+  if (checked.validRecords.length > 0) {
+    console.log("");
+    console.log("Sample valid record:");
+    console.log(JSON.stringify(checked.validRecords[0], null, 2));
+  }
+
+  console.log("");
+  console.log(
+    "valid = " + checked.validRecords.length +
+    ", invalid = " + checked.invalidRecords.length
+  );
 }
 
 main().catch(function (error) {

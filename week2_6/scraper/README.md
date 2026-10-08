@@ -71,9 +71,22 @@ scraper/
 ├── .env.example
 ├── package.json
 ├── cache/            (created at runtime, not committed)
+├── output/           (created at runtime, not committed)
+│   ├── books.json    (valid records)
+│   └── errors.json   (rejected records and the reason)
 └── src/
     └── index.js
 ```
+
+## Output
+
+`npm start` rewrites both files from scratch on every run, so running it twice
+gives the same 60 records instead of adding duplicates.
+
+| File | Contents |
+| ---- | -------- |
+| `output/books.json` | Records that passed the schema |
+| `output/errors.json` | Records that failed, with the validation reason |
 
 ## Requirements
 
@@ -98,6 +111,7 @@ npm start
 | Package | Why it is needed |
 | ------- | ---------------- |
 | cheerio | Reads HTML and finds elements by CSS selector |
+| zod | Checks every record against a schema before it is saved |
 
 No headless browser and no threading library. HTTP requests use the `fetch`
 function that is already built into Node.js.
