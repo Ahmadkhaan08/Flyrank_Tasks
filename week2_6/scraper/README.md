@@ -68,7 +68,9 @@ I will not reuse this code on another site without checking its rules and terms 
 scraper/
 ├── README.md
 ├── .gitignore
+├── .env.example
 ├── package.json
+├── cache/            (created at runtime, not committed)
 └── src/
     └── index.js
 ```
@@ -82,7 +84,24 @@ scraper/
 ```bash
 cd week2_6/scraper
 npm install
+cp .env.example .env
 ```
+
+## Settings
+
+All settings live in `.env`. Copy `.env.example` to `.env` before the first run.
+`.env` is ignored by git; `.env.example` is committed so the values are visible.
+
+| Variable | Example value | Meaning |
+| -------- | ------------- | ------- |
+| `BASE_URL` | `https://books.toscrape.com/catalogue/` | Where the catalogue pages are |
+| `USER_AGENT` | `FlyRankInternship-A9/1.0 (+https://github.com/Ahmadkhaan08/Flyrank_Tasks)` | Identifies the scraper and gives the site owner a contact link |
+| `TIMEOUT_MS` | `10000` | How long to wait for a response |
+| `DELAY_MS` | `2000` | How long to wait between requests |
+
+The file is read by `process.loadEnvFile()`, which is built into Node.js 20.12
+and newer, so no `dotenv` package is needed. If a variable is missing the script
+falls back to a safe default instead of crashing.
 
 ## Run
 
