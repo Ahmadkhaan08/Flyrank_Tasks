@@ -3,7 +3,10 @@
 // quiet: true stops dotenv from printing its own startup banner.
 require("dotenv").config({ quiet: true });
 
+const fs = require("fs");
+const path = require("path");
 const express = require("express");
+const OpenAI = require("openai");
 const swaggerUi = require("swagger-ui-express");
 const Database = require("better-sqlite3");
 const { createClient } = require("@supabase/supabase-js");
@@ -20,6 +23,11 @@ const port = process.env.PORT || 3000;
 // LLM_STUB=1 makes /triage return a fixed answer without calling any model.
 const llmStub = process.env.LLM_STUB === "1";
 
+// LLM settings, only needed when stub mode is off.
+const llmBaseUrl = process.env.LLM_BASE_URL;
+const llmApiKey = process.env.LLM_API_KEY;
+const llmModel = process.env.LLM_MODEL;
+
 // Stop early with a clear message if the credentials are missing,
 // instead of failing later with a confusing error.
 if (!supabaseUrl || !supabaseKey) {
@@ -31,6 +39,21 @@ if (!supabaseUrl || !supabaseKey) {
 // Initialize the Supabase client.
 // The auth routes use this; the task routes still use SQLite.
 const supabase = createClient(supabaseUrl, supabaseKey);
+
+// LLM setup for /triage
+// In live mode we need all three LLM settings, so stop early if one is missing.
+if (!llmStub && (!llmBaseUrl || !llmApiKey || !llmModel)) {
+  console.error("Missing LLM_BASE_URL, LLM_API_KEY or LLM_MODEL.");
+  console.error("Fill them in .env, or set LLM_STUB=1 to run without a model.");
+  process.exit(1);
+}
+
+const llmClient = llmStub ? null : new OpenAI({ baseURL: llmBaseUrl, apiKey: llmApiKey });
+
+// The system prompt lives in its own file, so changing it never means editing code.
+// It is read once at startup; a missing file stops the server right away.
+const triagePromptPath = path.join(__dirname, "prompts", "triage-v1.md");
+const triageSystemPrompt = fs.readFileSync(triagePromptPath, "utf8");
 
 // Database setup
 // Opens tasks.db, or creates the file if it does not exist yet.
@@ -278,7 +301,7 @@ const swaggerDocument = {
         responses: {
           200: { description: "category, priority and confidence" },
           400: { description: "Missing, non-string, empty or too long text" },
-          503: { description: "Live mode is not ready yet (set LLM_STUB=1)" }
+          502: { description: "The language model could not be reached" }
         }
       }
     },
@@ -494,7 +517,7 @@ app.post("/auth/logout", requireAuth, async (req, res) => {
 
 // Triage route
 // Sorts one support message into a fixed category (see JOB-CARD.md).
-app.post("/triage", (req, res) => {
+app.post("/triage", async (req, res) => {
   const body = req.body || {};
   const result = TriageInput.safeParse(body);
 
@@ -514,8 +537,29 @@ app.post("/triage", (req, res) => {
     return res.status(200).json(output);
   }
 
-  // The live model call is added in a later stage.
-  res.status(503).json({ error: "Live LLM mode is not available yet. Set LLM_STUB=1." });
+  // Live mode. The prompt goes in the system message, and the customer's
+  // text goes in the user message as JSON. It is never glued into the
+  // system prompt, so text like "ignore your rules" stays plain data.
+  try {
+    const response = await llmClient.chat.completions.create({
+      model: llmModel,
+      temperature: 0,
+      messages: [
+        { role: "system", content: triageSystemPrompt },
+        { role: "user", content: JSON.stringify({ text: result.data.text }) }
+      ]
+    });
+
+    const answer = response.choices[0].message.content;
+
+    // Sent as plain text for now: the model is asked for JSON,
+    // but nothing checks it against TriageOutput yet.
+    res.status(200).type("text/plain").send(answer);
+  } catch (error) {
+    // 502 means the server is fine but the model provider failed.
+    console.error("LLM call failed:", error.message);
+    res.status(502).json({ error: "The language model could not be reached" });
+  }
 });
 
 app.get("/tasks", (req, res) => {
