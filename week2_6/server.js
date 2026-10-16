@@ -24,10 +24,19 @@ const port = process.env.PORT || 3000;
 // LLM_STUB=1 makes /triage return a fixed answer without calling any model.
 const llmStub = process.env.LLM_STUB === "1";
 
+// Kill switch. LLM_ENABLED=false stops every model call at once.
+// Anything else, or leaving it out, keeps the model on.
+const llmEnabled = process.env.LLM_ENABLED !== "false";
+
 // LLM settings, only needed when stub mode is off.
 const llmBaseUrl = process.env.LLM_BASE_URL;
 const llmApiKey = process.env.LLM_API_KEY;
 const llmModel = process.env.LLM_MODEL;
+
+// Safety limits for model calls.
+const LLM_TIMEOUT_MS = 30000; // give up on one call after 30 seconds
+const LLM_MAX_ATTEMPTS = 3; // 1 try + up to 2 retries, only for temporary errors
+const LLM_RETRY_BASE_MS = 500; // waits about 0.5s, then 1s, plus a little random extra
 
 // Stop early with a clear message if the credentials are missing,
 // instead of failing later with a confusing error.
@@ -43,13 +52,25 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 // LLM setup for /triage
 // In live mode we need all three LLM settings, so stop early if one is missing.
-if (!llmStub && (!llmBaseUrl || !llmApiKey || !llmModel)) {
+const needsModel = llmEnabled && !llmStub;
+
+if (needsModel && (!llmBaseUrl || !llmApiKey || !llmModel)) {
   console.error("Missing LLM_BASE_URL, LLM_API_KEY or LLM_MODEL.");
   console.error("Fill them in .env, or set LLM_STUB=1 to run without a model.");
   process.exit(1);
 }
 
-const llmClient = llmStub ? null : new OpenAI({ baseURL: llmBaseUrl, apiKey: llmApiKey });
+// timeout replaces the SDK default of 10 minutes.
+// maxRetries: 0 turns off the SDK's own retries, so the only retries
+// are the ones in askModel below, where the rules are easy to see.
+const llmClient = needsModel
+  ? new OpenAI({
+      baseURL: llmBaseUrl,
+      apiKey: llmApiKey,
+      timeout: LLM_TIMEOUT_MS,
+      maxRetries: 0
+    })
+  : null;
 
 // The system prompt lives in its own file, so changing it never means editing code.
 // It is read once at startup; a missing file stops the server right away.
@@ -57,15 +78,93 @@ const triagePromptVersion = "triage-v1";
 const triagePromptPath = path.join(__dirname, "prompts", triagePromptVersion + ".md");
 const triageSystemPrompt = fs.readFileSync(triagePromptPath, "utf8");
 
+// Pauses for the given number of milliseconds.
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// True for errors that may go away if we simply try again:
+// timeouts, network drops, 429 (too many requests) and 5xx (provider broke).
+// False for 400, 401, 403 and every other 4xx: retrying sends the same
+// bad request or bad key again, so it can never succeed.
+function isTemporaryError(error) {
+  if (error instanceof OpenAI.APIConnectionError) {
+    return true; // also covers APIConnectionTimeoutError
+  }
+  if (error instanceof OpenAI.APIError) {
+    return error.status === 429 || error.status >= 500;
+  }
+  return false;
+}
+
+// Prints one JSON line per model call, so token use and cost can be added up later.
+function logLlmCall(record) {
+  console.log(JSON.stringify({ type: "llm_call", ...record }));
+}
+
 // Sends a list of messages to the model and returns its text reply.
-async function askModel(messages) {
-  const response = await llmClient.chat.completions.create({
-    model: llmModel,
-    temperature: 0,
-    messages: messages
-  });
-  // content can be null (for example when the model refuses), so use "".
-  return response.choices[0].message.content || "";
+// Temporary errors are retried with exponential backoff and jitter;
+// any other error is thrown straight away.
+async function askModel(messages, isRepair) {
+  const startTime = Date.now();
+
+  for (let attempt = 1; attempt <= LLM_MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await llmClient.chat.completions.create({
+        model: llmModel,
+        temperature: 0,
+        messages: messages
+      });
+
+      // Some providers leave usage out, so fall back to null.
+      const usage = response.usage || {};
+      logLlmCall({
+        timestamp: new Date().toISOString(),
+        prompt_version: triagePromptVersion,
+        model: llmModel,
+        prompt_tokens: usage.prompt_tokens ?? null,
+        completion_tokens: usage.completion_tokens ?? null,
+        total_tokens: usage.total_tokens ?? null,
+        duration_ms: Date.now() - startTime,
+        repair_triggered: isRepair,
+        attempts: attempt,
+        status: "ok"
+      });
+
+      // A reply can have no choices or null content; "" then fails validation.
+      const choice = response.choices && response.choices[0];
+      return (choice && choice.message && choice.message.content) || "";
+    } catch (error) {
+      const retry = isTemporaryError(error) && attempt < LLM_MAX_ATTEMPTS;
+
+      if (!retry) {
+        logLlmCall({
+          timestamp: new Date().toISOString(),
+          prompt_version: triagePromptVersion,
+          model: llmModel,
+          prompt_tokens: null,
+          completion_tokens: null,
+          total_tokens: null,
+          duration_ms: Date.now() - startTime,
+          repair_triggered: isRepair,
+          attempts: attempt,
+          status: "error",
+          http_status: error.status ?? null,
+          error: error.message
+        });
+        throw error;
+      }
+
+      // Exponential backoff: 500ms, then 1000ms. The random jitter stops many
+      // waiting requests from all hitting the provider at the same moment.
+      const delay = LLM_RETRY_BASE_MS * 2 ** (attempt - 1) + Math.floor(Math.random() * 250);
+      console.error(
+        "LLM call failed (" + (error.status || error.constructor.name) + "), retry " + attempt +
+        " of " + (LLM_MAX_ATTEMPTS - 1) + " in " + delay + "ms"
+      );
+      await sleep(delay);
+    }
+  }
 }
 
 // Database setup
@@ -315,7 +414,9 @@ const swaggerDocument = {
           200: { description: "category, priority and confidence" },
           400: { description: "Missing, non-string, empty or too long text" },
           422: { description: "Model response failed schema validation, even after one repair try" },
-          502:{ description: "The language model could not be reached" }
+          502: { description: "The language model could not be reached" },
+          503: { description: "Triage is temporarily disabled (LLM_ENABLED=false)" },
+          504: { description: "LLM provider timed out" }
         }
       }
     },
@@ -545,6 +646,11 @@ app.post("/triage", async (req, res) => {
     return res.status(400).json({ error: "Field 'text' is required and must be a string" });
   }
 
+  // Kill switch is checked before anything else that could reach a model.
+  if (!llmEnabled) {
+    return res.status(503).json({ error: "Triage is temporarily disabled" });
+  }
+
   if (llmStub) {
     // Check our own stub against the schema, so a typo in it is caught here.
     const output = TriageOutput.parse(STUB_RESPONSE);
@@ -562,7 +668,7 @@ app.post("/triage", async (req, res) => {
 
   try {
     // Attempt 1
-    const firstAnswer = await askModel(messages);
+    const firstAnswer = await askModel(messages, false);
     const firstCheck = checkModelOutput(firstAnswer);
     if (firstCheck.ok) {
       return res.status(200).json(firstCheck.data);
@@ -582,7 +688,7 @@ app.post("/triage", async (req, res) => {
           "\nReturn ONLY corrected JSON matching the schema."
       }
     ];
-    const secondAnswer = await askModel(repairMessages);
+    const secondAnswer = await askModel(repairMessages, true);
     const secondCheck = checkModelOutput(secondAnswer);
     if (secondCheck.ok) {
       return res.status(200).json(secondCheck.data);
@@ -605,7 +711,13 @@ app.post("/triage", async (req, res) => {
       details: secondCheck.error
     });
   } catch (error) {
-    // 502 means the server is fine but the model provider failed.
+    // Checked first, because a timeout is also a kind of connection error.
+    if (error instanceof OpenAI.APIConnectionTimeoutError) {
+      console.error("LLM call timed out after retries");
+      return res.status(504).json({ error: "LLM provider timed out" });
+    }
+    // 502 means the server is fine but the model provider failed,
+    // for example a wrong key (401) or 5xx errors that did not clear up.
     console.error("LLM call failed:", error.message);
     res.status(502).json({ error: "The language model could not be reached" });
   }
@@ -677,5 +789,11 @@ app.listen(port, () => {
   console.log("Server running and connected to Supabase");
   console.log("Server running on http://localhost:" + port);
   console.log("Docs available at http://localhost:" + port + "/docs");
-  console.log("Triage mode: " + (llmStub ? "stub (LLM_STUB=1)" : "live"));
+  let triageMode = "live";
+  if (!llmEnabled) {
+    triageMode = "disabled (LLM_ENABLED=false)";
+  } else if (llmStub) {
+    triageMode = "stub (LLM_STUB=1)";
+  }
+  console.log("Triage mode: " + triageMode);
 });
