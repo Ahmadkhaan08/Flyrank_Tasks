@@ -11,6 +11,7 @@ const swaggerUi = require("swagger-ui-express");
 const Database = require("better-sqlite3");
 const { createClient } = require("@supabase/supabase-js");
 const { TriageInput, TriageOutput, STUB_RESPONSE } = require("./src/llm/schema");
+const { checkModelOutput, writeQuarantine } = require("./src/llm/validate");
 
 const app = express();
 app.use(express.json());
@@ -52,8 +53,20 @@ const llmClient = llmStub ? null : new OpenAI({ baseURL: llmBaseUrl, apiKey: llm
 
 // The system prompt lives in its own file, so changing it never means editing code.
 // It is read once at startup; a missing file stops the server right away.
-const triagePromptPath = path.join(__dirname, "prompts", "triage-v1.md");
+const triagePromptVersion = "triage-v1";
+const triagePromptPath = path.join(__dirname, "prompts", triagePromptVersion + ".md");
 const triageSystemPrompt = fs.readFileSync(triagePromptPath, "utf8");
+
+// Sends a list of messages to the model and returns its text reply.
+async function askModel(messages) {
+  const response = await llmClient.chat.completions.create({
+    model: llmModel,
+    temperature: 0,
+    messages: messages
+  });
+  // content can be null (for example when the model refuses), so use "".
+  return response.choices[0].message.content || "";
+}
 
 // Database setup
 // Opens tasks.db, or creates the file if it does not exist yet.
@@ -301,7 +314,8 @@ const swaggerDocument = {
         responses: {
           200: { description: "category, priority and confidence" },
           400: { description: "Missing, non-string, empty or too long text" },
-          502: { description: "The language model could not be reached" }
+          422: { description: "Model response failed schema validation, even after one repair try" },
+          502:{ description: "The language model could not be reached" }
         }
       }
     },
@@ -540,21 +554,56 @@ app.post("/triage", async (req, res) => {
   // Live mode. The prompt goes in the system message, and the customer's
   // text goes in the user message as JSON. It is never glued into the
   // system prompt, so text like "ignore your rules" stays plain data.
+  const userMessage = JSON.stringify({ text: result.data.text });
+  const messages = [
+    { role: "system", content: triageSystemPrompt },
+    { role: "user", content: userMessage }
+  ];
+
   try {
-    const response = await llmClient.chat.completions.create({
-      model: llmModel,
-      temperature: 0,
-      messages: [
-        { role: "system", content: triageSystemPrompt },
-        { role: "user", content: JSON.stringify({ text: result.data.text }) }
-      ]
+    // Attempt 1
+    const firstAnswer = await askModel(messages);
+    const firstCheck = checkModelOutput(firstAnswer);
+    if (firstCheck.ok) {
+      return res.status(200).json(firstCheck.data);
+    }
+
+    // Attempt 2, the one and only repair try. The model sees its own
+    // broken answer and the exact reason it was rejected.
+    console.error("Triage answer rejected, retrying once:", firstCheck.error);
+    const repairMessages = [
+      ...messages,
+      { role: "assistant", content: firstAnswer },
+      {
+        role: "user",
+        content:
+          "Your previous answer was rejected for this reason: " +
+          firstCheck.error +
+          "\nReturn ONLY corrected JSON matching the schema."
+      }
+    ];
+    const secondAnswer = await askModel(repairMessages);
+    const secondCheck = checkModelOutput(secondAnswer);
+    if (secondCheck.ok) {
+      return res.status(200).json(secondCheck.data);
+    }
+
+    // Both attempts failed. Save everything for later review, then tell the caller.
+    // The raw model text is only logged, never sent back.
+    console.error("Triage answer rejected again, quarantined:", secondCheck.error);
+    writeQuarantine({
+      timestamp: new Date().toISOString(),
+      prompt_version: triagePromptVersion,
+      raw_input: result.data.text,
+      validation_error: secondCheck.error,
+      raw_model_output: secondAnswer,
+      first_model_output: firstAnswer,
+      first_validation_error: firstCheck.error
     });
-
-    const answer = response.choices[0].message.content;
-
-    // Sent as plain text for now: the model is asked for JSON,
-    // but nothing checks it against TriageOutput yet.
-    res.status(200).type("text/plain").send(answer);
+    return res.status(422).json({
+      error: "Model response failed schema validation",
+      details: secondCheck.error
+    });
   } catch (error) {
     // 502 means the server is fine but the model provider failed.
     console.error("LLM call failed:", error.message);
