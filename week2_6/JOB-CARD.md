@@ -13,7 +13,9 @@
 - `text` is required.
 - `text` must be a string.
 - After trimming spaces, `text` must have between 1 and 2000 characters.
-- Any other input gets a `400 Bad Request` and is never sent to the model.
+- Any other input gets a `400 Bad Request` and is never sent to the model:
+  - missing, non-string or empty `text`: `{ "error": "Field 'text' is required and must be a string" }`
+  - `text` over 2000 characters: `{ "error": "Field 'text' must be at most 2000 characters" }`
 
 ## Output
 
@@ -23,7 +25,7 @@ The response is always this exact JSON shape. It has no extra keys and no missin
 {
   "category": "billing",
   "priority": "high",
-  "confidence": "medium"
+  "confidence": 0.85
 }
 ```
 
@@ -31,7 +33,7 @@ The response is always this exact JSON shape. It has no extra keys and no missin
 |--------------|--------|--------------------------------------------------------------------|
 | `category`   | string | `"billing"`, `"technical"`, `"account"`, `"feedback"`, `"other"`   |
 | `priority`   | string | `"low"`, `"medium"`, `"high"`                                      |
-| `confidence` | string | `"low"`, `"medium"`, `"high"`                                      |
+| `confidence` | number | `0.0` to `1.0` (0 = no idea, 1 = completely sure)                  |
 
 Category meanings:
 
@@ -43,7 +45,7 @@ Category meanings:
 
 ## It must never
 
-- Never return a category, priority, or confidence value that is not in the tables above.
+- Never return a category or priority value that is not in the table above, or a confidence outside 0.0 to 1.0.
 - Never invent a new category, such as `"shipping"` or `"urgent"`.
 - Never add free text, explanations, apologies, or a reply to the customer.
 - Never add extra keys, such as `"reason"` or `"summary"`.
@@ -56,7 +58,7 @@ Category meanings:
 If the message is unclear, mixed, empty of meaning, or not a support message, return:
 
 ```json
-{ "category": "other", "priority": "low", "confidence": "low" }
+{ "category": "other", "priority": "low", "confidence": 0 }
 ```
 
 The server also returns this same fallback when the model output is not valid JSON or contains any value outside the allowed lists.

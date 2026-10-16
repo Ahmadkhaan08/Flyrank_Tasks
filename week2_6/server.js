@@ -7,6 +7,7 @@ const express = require("express");
 const swaggerUi = require("swagger-ui-express");
 const Database = require("better-sqlite3");
 const { createClient } = require("@supabase/supabase-js");
+const { TriageInput, TriageOutput, STUB_RESPONSE } = require("./src/llm/schema");
 
 const app = express();
 app.use(express.json());
@@ -15,6 +16,9 @@ app.use(express.json());
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const port = process.env.PORT || 3000;
+
+// LLM_STUB=1 makes /triage return a fixed answer without calling any model.
+const llmStub = process.env.LLM_STUB === "1";
 
 // Stop early with a clear message if the credentials are missing,
 // instead of failing later with a confusing error.
@@ -249,6 +253,35 @@ const swaggerDocument = {
         }
       }
     },
+    "/triage": {
+      post: {
+        summary: "Classify one support message",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["text"],
+                properties: {
+                  text: {
+                    type: "string",
+                    minLength: 1,
+                    maxLength: 2000,
+                    example: "I was charged twice this month"
+                  }
+                }
+              }
+            }
+          }
+        },
+        responses: {
+          200: { description: "category, priority and confidence" },
+          400: { description: "Missing, non-string, empty or too long text" },
+          503: { description: "Live mode is not ready yet (set LLM_STUB=1)" }
+        }
+      }
+    },
     "/tasks": {
       get: {
         summary: "Get all tasks",
@@ -354,7 +387,7 @@ app.get("/", (req, res) => {
   res.status(200).json({
     name: "Task API",
     version: "1.0",
-    endpoints: ["/tasks"]
+    endpoints: ["/tasks", "/triage"]
   });
 });
 
@@ -459,6 +492,32 @@ app.post("/auth/logout", requireAuth, async (req, res) => {
   res.status(204).send();
 });
 
+// Triage route
+// Sorts one support message into a fixed category (see JOB-CARD.md).
+app.post("/triage", (req, res) => {
+  const body = req.body || {};
+  const result = TriageInput.safeParse(body);
+
+  if (!result.success) {
+    // "too_big" means the text was longer than 2000 characters.
+    // Every other problem means it was missing, not a string, or empty.
+    const tooLong = result.error.issues.some((issue) => issue.code === "too_big");
+    if (tooLong) {
+      return res.status(400).json({ error: "Field 'text' must be at most 2000 characters" });
+    }
+    return res.status(400).json({ error: "Field 'text' is required and must be a string" });
+  }
+
+  if (llmStub) {
+    // Check our own stub against the schema, so a typo in it is caught here.
+    const output = TriageOutput.parse(STUB_RESPONSE);
+    return res.status(200).json(output);
+  }
+
+  // The live model call is added in a later stage.
+  res.status(503).json({ error: "Live LLM mode is not available yet. Set LLM_STUB=1." });
+});
+
 app.get("/tasks", (req, res) => {
   const rows = selectAllTasks.all();
   res.status(200).json(rows.map(toTask));
@@ -525,4 +584,5 @@ app.listen(port, () => {
   console.log("Server running and connected to Supabase");
   console.log("Server running on http://localhost:" + port);
   console.log("Docs available at http://localhost:" + port + "/docs");
+  console.log("Triage mode: " + (llmStub ? "stub (LLM_STUB=1)" : "live"));
 });
