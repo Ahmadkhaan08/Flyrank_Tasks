@@ -1,0 +1,50 @@
+[
+  {
+    "id": 1,
+    "kind": "clear",
+    "input": { "text": "I was charged twice for my monthly subscription. Please refund the extra payment." },
+    "expected": { "category": "billing", "priority": "high" }
+  },
+  {
+    "id": 2,
+    "kind": "clear",
+    "input": { "text": "The app crashes every time I try to upload a photo, but everything else works." },
+    "expected": { "category": "technical", "priority": "medium" }
+  },
+  {
+    "id": 3,
+    "kind": "clear",
+    "input": { "text": "I forgot my password and the reset email never arrives, so I am locked out of my account." },
+    "expected": { "category": "account", "priority": "high" }
+  },
+  {
+    "id": 4,
+    "kind": "clear",
+    "input": { "text": "It would be great if you added a dark mode to the dashboard." },
+    "expected": { "category": "feedback", "priority": "low" }
+  },
+  {
+    "id": 5,
+    "kind": "clear",
+    "input": { "text": "Where can I download the invoice for last month's payment?" },
+    "expected": { "category": "billing", "priority": "low" }
+  },
+  {
+    "id": 6,
+    "kind": "clear",
+    "input": { "text": "Just wanted to say your support team was amazing yesterday. Thank you!" },
+    "expected": { "category": "feedback", "priority": "low" }
+  },
+  {
+    "id": 7,
+    "kind": "ambiguous",
+    "input": { "text": "Since your update yesterday I can't log in, the login page just shows a blank white screen." },
+    "expected": { "category": "technical", "priority": "high" }
+  },
+  {
+    "id": 8,
+    "kind": "unsure",
+    "input": { "text": "asdf ok whatever" },
+    "expected": { "category": "other", "priority": "low" }
+  }
+]
